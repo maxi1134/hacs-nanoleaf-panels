@@ -1,12 +1,12 @@
 {
   "domain": "nanoleaf_panels",
   "name": "Nanoleaf Panels",
-  "codeowners": ["@UnsignedLong"],
+  "codeowners": ["@UnsignedLong", "@maxi1134"],
   "config_flow": true,
   "documentation": "https://github.com/UnsignedLong/hacs-nanoleaf-panels",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/UnsignedLong/hacs-nanoleaf-panels/issues",
   "loggers": ["aionanoleaf2"],
   "requirements": ["aionanoleaf2==1.0.2"],
-  "version": "1.1.0"
+  "version": "1.1.2"
 }

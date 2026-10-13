@@ -15,15 +15,14 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.template import Template
 
+from .const import DATA_WRITERS, DEFAULT_TRANSITION_TIME, DOMAIN
 from .nanoleaf_api import NanoleafApiClient
+from .panel_writer import PanelWriter
 
-DOMAIN = "nanoleaf_panels"
 SERVICE_SET_PANELS = "set_panels"
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 DATA_YAML_CONFIGURED = "yaml_configured"
-CONF_EXPOSE_PANELS = "expose_panels"
-CONF_NANOLEAF_ENTITY = "nanoleaf_entity"
 
 PLATFORMS = [Platform.LIGHT]
 
@@ -44,7 +43,6 @@ ATTR_SPEED = "speed"
 ATTR_COLOR = "color"
 ATTR_CONDITION = "condition"
 ATTR_FALLBACK = "fallback"
-DEFAULT_TRANSITION_TIME = 20
 SPEED_SLOW = 30
 SPEED_MEDIUM = 15
 SPEED_FAST = 5
@@ -208,16 +206,6 @@ def _generate_preset_frames(
     return [(r, g, b, 0, t)]
 
 
-def _build_anim_data(resolved_panels: list[dict]) -> str:
-    parts = [str(len(resolved_panels))]
-    for panel in resolved_panels:
-        frames = panel["frames"]
-        parts.append(f"{panel['panel_id']} {len(frames)}")
-        for r, g, b, w, t in frames:
-            parts.append(f"{r} {g} {b} {w} {t}")
-    return " ".join(parts)
-
-
 def _resolve_frame(frame: Mapping[str, int]) -> tuple[int, int, int, int, int]:
     r, g, b = _resolve_rgb(frame) if ATTR_HUE in frame else (frame[ATTR_R], frame[ATTR_G], frame[ATTR_B])
     return (r, g, b, frame[ATTR_WHITE], frame[ATTR_TRANSITION_TIME])
@@ -314,6 +302,22 @@ def _get_or_create_api_client(
     return clients[nanoleaf_entry_id]
 
 
+def _get_or_create_writer(
+    hass: HomeAssistant, api_client: NanoleafApiClient, nanoleaf_entry_id: str
+) -> PanelWriter:
+    """Return the PanelWriter for the given entry, creating it if needed.
+
+    Every write to a device must go through its one writer, so that the panel
+    entities and the set_panels service are serialized against each other.
+    """
+    writers: dict[str, PanelWriter] = (
+        hass.data.setdefault(DOMAIN, {}).setdefault(DATA_WRITERS, {})
+    )
+    if nanoleaf_entry_id not in writers:
+        writers[nanoleaf_entry_id] = PanelWriter(hass, api_client, nanoleaf_entry_id)
+    return writers[nanoleaf_entry_id]
+
+
 async def _async_write_panels(
     hass: HomeAssistant,
     api_client: NanoleafApiClient,
@@ -330,63 +334,11 @@ async def _async_write_panels(
     has_animation_panels keeps the device in custom (loop) mode even when all
     current frames are static, to prevent flicker when conditions toggle.
     """
-    # Only trust the *Static* animation when the device is actually running it.
-    # In hs/ct color mode the device ignores the animation and shows a uniform
-    # solid color; the *Static* data would be stale from the last custom write.
-    info = await api_client.async_get_device_info()
-    selected_effect = info.get("effects", {}).get("selectedEffect")
-
-    if selected_effect == "*Static*":
-        current_colors = await api_client.async_get_current_panel_colors()
-    else:
-        current_colors = {}
-
-    if not current_colors:
-        current_colors = (
-            hass.data.get(DOMAIN, {}).get("panel_state", {}).get(nanoleaf_entry_id, {})
-        )
-
-    is_animated = any(len(frames) > 1 for frames in panels_override.values())
-    use_custom_mode = has_animation_panels or is_animated
-
-    final_panels = [
-        {
-            "panel_id": pid,
-            "frames": panels_override[pid]
-            if pid in panels_override
-            else [current_colors[pid]]
-            if pid in current_colors
-            else [(0, 0, 0, 0, DEFAULT_TRANSITION_TIME)],
-        }
-        for pid in all_panel_ids
-    ]
-
-    if use_custom_mode:
-        final_panels = [
-            {
-                "panel_id": p["panel_id"],
-                "frames": p["frames"]
-                if len(p["frames"]) > 1
-                else [p["frames"][0], p["frames"][0]],
-            }
-            for p in final_panels
-        ]
-
-    hass.data.setdefault(DOMAIN, {}).setdefault("panel_state", {})[nanoleaf_entry_id] = {
-        p["panel_id"]: p["frames"][0] for p in final_panels
-    }
-
-    payload = {
-        "write": {
-            "command": "display",
-            "animType": "custom" if use_custom_mode else "static",
-            "animName": "",
-            "animData": _build_anim_data(final_panels),
-            "loop": use_custom_mode,
-            "palette": [],
-        }
-    }
-    await api_client.async_write_effects(payload)
+    writer = _get_or_create_writer(hass, api_client, nanoleaf_entry_id)
+    writer.panel_ids = all_panel_ids
+    await writer.async_write(
+        panels_override, has_animation_panels=has_animation_panels
+    )
 
 
 async def _async_handle_set_panels(hass: HomeAssistant, service_call: ServiceCall) -> None:

@@ -10,7 +10,7 @@ from homeassistant.helpers.selector import (
     EntitySelectorConfig,
 )
 
-from . import CONF_EXPOSE_PANELS, CONF_NANOLEAF_ENTITY, DOMAIN
+from .const import CONF_EXPOSE_PANELS, CONF_NANOLEAF_ENTITY, DOMAIN
 
 
 class NanoleafPanelsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):

@@ -27,15 +27,15 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from . import (
+from . import _get_or_create_api_client, _get_or_create_writer
+from .const import (
+    BLACK,
     CONF_EXPOSE_PANELS,
     CONF_NANOLEAF_ENTITY,
     DEFAULT_TRANSITION_TIME,
-    DOMAIN,
-    _async_write_panels,
-    _get_or_create_api_client,
 )
 from .nanoleaf_api import NanoleafApiClient
+from .panel_writer import PanelWriter, get_cached_panel_state, set_cached_panel_state
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ class NanoleafPanelCoordinator(
         self,
         hass: HomeAssistant,
         api_client: NanoleafApiClient,
+        writer: PanelWriter,
         nanoleaf_entry_id: str,
         nanoleaf_entity_id: str,
     ) -> None:
@@ -73,6 +74,7 @@ class NanoleafPanelCoordinator(
             update_interval=timedelta(seconds=60),
         )
         self._api_client = api_client
+        self.writer = writer
         self._nanoleaf_entry_id = nanoleaf_entry_id
         self.nanoleaf_entity_id = nanoleaf_entity_id
         self.panel_ids: list[int] = []
@@ -84,11 +86,23 @@ class NanoleafPanelCoordinator(
 
     async def _async_update_data(self) -> dict[int, tuple[int, int, int, int, int]]:
         """Poll current panel colors; merge with in-memory cache as fallback."""
-        cache: dict[int, tuple[int, int, int, int, int]] = (
-            self.hass.data.get(DOMAIN, {})
-            .get("panel_state", {})
-            .get(self._nanoleaf_entry_id, {})
-        )
+        # Hold the write lock so a poll can't interleave with a write and
+        # cache the colors from before it.
+        async with self.writer.lock:
+            data = await self._async_poll()
+            # Keep the write path's cache in step with what the entities
+            # show, so the next write merges against the same colors.
+            set_cached_panel_state(self.hass, self._nanoleaf_entry_id, data)
+        return data
+
+    async def _async_poll(self) -> dict[int, tuple[int, int, int, int, int]]:
+        cache = get_cached_panel_state(self.hass, self._nanoleaf_entry_id)
+
+        if self.writer.recently_written:
+            # The device is still catching up with our last write and would
+            # report the colors from before it; our own record is current.
+            self.last_poll_had_device_data = True
+            return dict(cache)
 
         try:
             info = await self._api_client.async_get_device_info()
@@ -128,7 +142,19 @@ class NanoleafPanelCoordinator(
 
         # Effect mode with a non-static animation — per-panel colors unavailable.
         self.last_poll_had_device_data = False
-        return cache
+        return dict(cache)
+
+    @callback
+    def async_handle_write(
+        self, state: dict[int, tuple[int, int, int, int, int]]
+    ) -> None:
+        """Show what was just written without re-polling the device.
+
+        Re-polling right away would race the device, which hasn't updated its
+        *Static* animation yet.
+        """
+        self.last_poll_had_device_data = True
+        self.async_set_updated_data(dict(state))
 
 
 class NanoleafPanelLight(
@@ -165,8 +191,9 @@ class NanoleafPanelLight(
     def is_on(self) -> bool:
         # Mirror the parent Nanoleaf entity's on/off state so turning off the
         # device via the official integration is immediately reflected here.
-        parent = self.hass.states.get(self.coordinator.nanoleaf_entity_id)
-        if parent is None or parent.state in ("off", "unavailable", "unknown"):
+        # The writer also counts a device we just lit as on, before the parent
+        # entity has caught up.
+        if not self.coordinator.writer.device_is_lit:
             return False
         # If the last poll returned no device data the Nanoleaf is in effect
         # mode (or just turned on) and the cache cannot be trusted to reflect
@@ -222,79 +249,29 @@ class NanoleafPanelLight(
         r_f, g_f, b_f = colorsys.hsv_to_rgb(new_h, new_s, new_v)
         r, g, b = round(r_f * 255), round(g_f * 255), round(b_f * 255)
 
-        # When the parent Nanoleaf is off, all other panels must be forced to
+        # When the device is dark, the writer forces all other panels to
         # black so that only this panel lights up (not the full cached scene).
-        parent = self.hass.states.get(self.coordinator.nanoleaf_entity_id)
-        if parent is None or parent.state != "on":
-            panels_override: dict[int, list[tuple[int, int, int, int, int]]] = {
-                pid: [(0, 0, 0, 0, DEFAULT_TRANSITION_TIME)]
-                for pid in self.coordinator.panel_ids
-                if pid != self._panel_id
-            }
-            panels_override[self._panel_id] = [(r, g, b, 0, DEFAULT_TRANSITION_TIME)]
-        else:
-            panels_override = {self._panel_id: [(r, g, b, 0, DEFAULT_TRANSITION_TIME)]}
-
-        # Seed the cache with the coordinator's current per-panel state so
-        # _async_write_panels uses the right colors for non-overridden panels
-        # instead of potentially stale values from previous writes.
-        if self.coordinator.data:
-            self.hass.data.setdefault(DOMAIN, {}).setdefault("panel_state", {})[
-                self.coordinator._nanoleaf_entry_id
-            ] = dict(self.coordinator.data)
-
-        await _async_write_panels(
-            self.hass,
-            self.coordinator._api_client,
-            self.coordinator._nanoleaf_entry_id,
-            self.coordinator.panel_ids,
-            panels_override,
+        # The write is batched with any concurrent panel calls and pushed to
+        # the coordinator by the writer.
+        await self.coordinator.writer.async_write(
+            {self._panel_id: [(r, g, b, 0, DEFAULT_TRANSITION_TIME)]},
+            blank_others_when_off=True,
         )
-        # Push the written state directly into the coordinator instead of
-        # re-polling the device.  This avoids a race where the device hasn't
-        # updated its *Static* animation yet when we immediately read it back.
-        new_data = dict(
-            self.hass.data.get(DOMAIN, {})
-            .get("panel_state", {})
-            .get(self.coordinator._nanoleaf_entry_id, {})
-        )
-        self.coordinator.last_poll_had_device_data = True
-        self.coordinator.async_set_updated_data(new_data)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        # If the parent Nanoleaf is already off, all panel entities already
-        # report off — nothing to write to the device.
-        parent = self.hass.states.get(self.coordinator.nanoleaf_entity_id)
-        if parent is None or parent.state != "on":
+        # If the device is already dark, all panel entities already report
+        # off — nothing to write to the device.
+        if not self.coordinator.writer.device_is_lit:
             return
 
-        # Seed the cache with the coordinator's current per-panel state so
-        # _async_write_panels uses the right colors for non-overridden panels.
-        if self.coordinator.data:
-            self.hass.data.setdefault(DOMAIN, {}).setdefault("panel_state", {})[
-                self.coordinator._nanoleaf_entry_id
-            ] = dict(self.coordinator.data)
-
-        await _async_write_panels(
-            self.hass,
-            self.coordinator._api_client,
-            self.coordinator._nanoleaf_entry_id,
-            self.coordinator.panel_ids,
-            {self._panel_id: [(0, 0, 0, 0, DEFAULT_TRANSITION_TIME)]},
-        )
-
-        # Push the written state directly into the coordinator.
-        new_data = dict(
-            self.hass.data.get(DOMAIN, {})
-            .get("panel_state", {})
-            .get(self.coordinator._nanoleaf_entry_id, {})
-        )
-        self.coordinator.last_poll_had_device_data = True
-        self.coordinator.async_set_updated_data(new_data)
+        await self.coordinator.writer.async_write({self._panel_id: [BLACK]})
 
         # If every panel is now black, turn off the parent Nanoleaf entity.
+        new_data = get_cached_panel_state(
+            self.hass, self.coordinator._nanoleaf_entry_id
+        )
         all_off = all(
-            new_data.get(pid, (0, 0, 0, 0, 0))[:3] == (0, 0, 0)
+            new_data.get(pid, BLACK)[:3] == (0, 0, 0)
             for pid in self.coordinator.panel_ids
         )
         if all_off:
@@ -359,11 +336,21 @@ async def async_setup_entry(
         _LOGGER.error("Failed to fetch Nanoleaf panel layout: %s", err)
         return
 
+    # The writer is shared with the set_panels service so that every write
+    # to this device is serialized, whichever path it comes from.
+    writer = _get_or_create_writer(hass, api_client, nanoleaf_entry_id)
+    writer.panel_ids = panel_ids
+    writer.nanoleaf_entity_id = nanoleaf_entity_id
+    # A writer that outlived a reload may remember lighting a device that has
+    # since been switched off; start from the parent entity's view instead.
+    writer.note_device_off()
+
     coordinator = NanoleafPanelCoordinator(
-        hass, api_client, nanoleaf_entry_id, nanoleaf_entity_id
+        hass, api_client, writer, nanoleaf_entry_id, nanoleaf_entity_id
     )
     coordinator.panel_ids = panel_ids
     await coordinator.async_config_entry_first_refresh()
+    entry.async_on_unload(writer.async_add_listener(coordinator.async_handle_write))
 
     # When the parent Nanoleaf entity changes state (on ↔ off ↔ unavailable):
     # - Turning OFF: re-broadcast current data immediately so panel entities
@@ -373,11 +360,22 @@ async def async_setup_entry(
     #   poll returns nothing and panels keep their last cached state).
     @callback
     def _on_nanoleaf_state_change(event: Any) -> None:
+        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
         if new_state is not None and new_state.state == "on":
             coordinator.hass.async_create_task(coordinator.async_request_refresh())
-        else:
-            coordinator.async_set_updated_data(coordinator.data or {})
+            return
+        # Only a real on -> off transition, or the device dropping off the
+        # network, means it went dark.  An attribute update while the parent
+        # still reads "off" can arrive right after we lit the device, before
+        # the official integration has caught up with the write.
+        if (
+            new_state is None
+            or new_state.state != "off"
+            or (old_state is not None and old_state.state == "on")
+        ):
+            writer.note_device_off()
+        coordinator.async_set_updated_data(coordinator.data or {})
 
     entry.async_on_unload(
         async_track_state_change_event(

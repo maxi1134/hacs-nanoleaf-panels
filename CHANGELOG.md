@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.2
+
+- Fixed panel entities turned on in quick succession leaving only one panel lit. Each write replaces the whole display, and concurrent writes merged against the colors from before the burst, so the last one won
+- All writes to a device (panel entities and `set_panels`) now go through a single serialized writer. Calls that arrive within 50 ms of each other are merged into one device write
+- A panel turned on while the Nanoleaf is off no longer blanks panels lit moments earlier in the same burst. The writer tracks what it lit itself instead of relying only on the parent entity, whose state lags the write
+- For 5 seconds after a write, the integration trusts the colors it wrote over the device's read-back, which still reports the previous frame
+- Device polls no longer interleave with writes, and keep the write cache in step with the panel entities
+- Panel entities now update immediately after a `set_panels` call too
+- Turning off a panel right after lighting it from a dark device no longer gets skipped
+
 ## 1.1.1
 
 - Isolated all aionanoleaf2 private `_request` calls into a single `NanoleafApiClient` adapter module — breakage from library updates is now confined to one place
