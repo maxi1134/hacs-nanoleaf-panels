@@ -298,7 +298,9 @@ def _get_or_create_api_client(
         hass.data.setdefault(DOMAIN, {}).setdefault("clients", {})
     )
     if nanoleaf_entry_id not in clients:
-        clients[nanoleaf_entry_id] = NanoleafApiClient(hass, host, token)
+        clients[nanoleaf_entry_id] = NanoleafApiClient(
+            hass, nanoleaf_entry_id, host, token
+        )
     return clients[nanoleaf_entry_id]
 
 

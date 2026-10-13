@@ -11,13 +11,31 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
-from aionanoleaf2 import Nanoleaf
+from aiohttp import ClientError, ClientResponse
+from aionanoleaf2 import Nanoleaf, NanoleafException
 
+from homeassistant.const import CONF_HOST, CONF_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def describe_error(err: BaseException) -> str:
+    """Describe an exception together with its cause.
+
+    aionanoleaf2 raises its exceptions without a message (e.g. a bare
+    ``Unavailable`` once its retries run out), which would otherwise log as an
+    empty string.
+    """
+
+    def _one(exc: BaseException) -> str:
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+    if err.__cause__ is None:
+        return _one(err)
+    return f"{_one(err)} ({_one(err.__cause__)})"
 
 
 def _parse_anim_data(anim_data_str: str) -> dict[int, tuple[int, int, int, int, int]]:
@@ -50,10 +68,19 @@ class NanoleafApiClient:
     ``aiohttp.ClientSession`` is obtained via ``async_get_clientsession`` and
     is shared across the entire HA instance, eliminating connection-per-call
     overhead.
+
+    The host and token are read from the official Nanoleaf config entry before
+    every request.  Discovery rewrites that entry when the device moves to a
+    new address, and following it keeps this client working without a reload.
     """
 
-    def __init__(self, hass: HomeAssistant, host: str, token: str) -> None:
+    def __init__(
+        self, hass: HomeAssistant, nanoleaf_entry_id: str, host: str, token: str
+    ) -> None:
+        self._hass = hass
+        self._nanoleaf_entry_id = nanoleaf_entry_id
         self._host = host
+        self._token = token
         self._nanoleaf = Nanoleaf(async_get_clientsession(hass), host, token)
 
     @property
@@ -61,9 +88,39 @@ class NanoleafApiClient:
         """Return the device host address."""
         return self._host
 
+    def _current_nanoleaf(self) -> Nanoleaf:
+        """Return the library client, rebuilt if the entry's host or token changed."""
+        entry = self._hass.config_entries.async_get_entry(self._nanoleaf_entry_id)
+        if entry is not None:
+            host = entry.data.get(CONF_HOST, self._host)
+            token = entry.data.get(CONF_TOKEN, self._token)
+            if (host, token) != (self._host, self._token):
+                _LOGGER.info(
+                    "Nanoleaf config entry changed (host %s -> %s); reconnecting",
+                    self._host,
+                    host,
+                )
+                self._host, self._token = host, token
+                self._nanoleaf = Nanoleaf(
+                    async_get_clientsession(self._hass), host, token
+                )
+        return self._nanoleaf
+
+    async def _async_request(
+        self, method: str, path: str, data: dict[str, Any] | None = None
+    ) -> ClientResponse:
+        """Send a request to the device at its current address."""
+        nanoleaf = self._current_nanoleaf()
+        try:
+            return await nanoleaf._request(method, path, data)
+        except (NanoleafException, ClientError) as err:
+            raise HomeAssistantError(
+                f"Request to Nanoleaf at {self._host} failed: {describe_error(err)}"
+            ) from err
+
     async def async_get_device_info(self) -> dict[str, Any]:
         """Fetch full device info from the Nanoleaf."""
-        resp = await self._nanoleaf._request("get", "")
+        resp = await self._async_request("get", "")
         data = cast(dict[str, Any], await resp.json())
         resp.release()
         return data
@@ -85,7 +142,7 @@ class NanoleafApiClient:
     ) -> dict[int, tuple[int, int, int, int, int]]:
         """Request the current static panel colors. Returns {} if unavailable."""
         try:
-            response = await self._nanoleaf._request(
+            response = await self._async_request(
                 "put",
                 "effects",
                 {"write": {"command": "request", "animName": "*Static*"}},
@@ -96,10 +153,14 @@ class NanoleafApiClient:
             if anim_data_str:
                 return _parse_anim_data(anim_data_str)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Could not fetch current panel colors from %s: %s", self._host, err)
+            _LOGGER.debug(
+                "Could not fetch current panel colors from %s: %s",
+                self._host,
+                describe_error(err),
+            )
         return {}
 
     async def async_write_effects(self, payload: dict[str, Any]) -> None:
         """Send an effects write command to the Nanoleaf."""
-        response = await self._nanoleaf._request("put", "effects", payload)
+        response = await self._async_request("put", "effects", payload)
         response.release()

@@ -17,6 +17,7 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_TOKEN
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -34,7 +35,7 @@ from .const import (
     CONF_NANOLEAF_ENTITY,
     DEFAULT_TRANSITION_TIME,
 )
-from .nanoleaf_api import NanoleafApiClient
+from .nanoleaf_api import NanoleafApiClient, describe_error
 from .panel_writer import PanelWriter, get_cached_panel_state, set_cached_panel_state
 
 _LOGGER = logging.getLogger(__name__)
@@ -138,7 +139,8 @@ class NanoleafPanelCoordinator(
                 return {**cache, **uniform}
 
         except Exception as err:  # noqa: BLE001
-            raise UpdateFailed(f"Failed to fetch Nanoleaf state: {err}") from err
+            reason = str(err) or describe_error(err)
+            raise UpdateFailed(f"Failed to fetch Nanoleaf state: {reason}") from err
 
         # Effect mode with a non-static animation — per-panel colors unavailable.
         self.last_poll_had_device_data = False
@@ -333,8 +335,12 @@ async def async_setup_entry(
     try:
         panel_ids = await api_client.async_get_panel_order()
     except Exception as err:  # noqa: BLE001
-        _LOGGER.error("Failed to fetch Nanoleaf panel layout: %s", err)
-        return
+        # Home Assistant retries the platform in the background, so the panels
+        # appear once the device is reachable again.
+        reason = str(err) or describe_error(err)
+        raise PlatformNotReady(
+            f"Could not fetch the Nanoleaf panel layout: {reason}"
+        ) from err
 
     # The writer is shared with the set_panels service so that every write
     # to this device is serialized, whichever path it comes from.
@@ -349,7 +355,13 @@ async def async_setup_entry(
         hass, api_client, writer, nanoleaf_entry_id, nanoleaf_entity_id
     )
     coordinator.panel_ids = panel_ids
-    await coordinator.async_config_entry_first_refresh()
+    # Not async_config_entry_first_refresh(): the ConfigEntryNotReady it raises
+    # is rejected in a forwarded platform and never retried.
+    await coordinator.async_refresh()
+    if not coordinator.last_update_success:
+        raise PlatformNotReady(
+            f"Could not read the Nanoleaf panel colors: {coordinator.last_exception}"
+        )
     entry.async_on_unload(writer.async_add_listener(coordinator.async_handle_write))
 
     # When the parent Nanoleaf entity changes state (on ↔ off ↔ unavailable):

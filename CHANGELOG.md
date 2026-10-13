@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+
+- Fixed panel entities failing to load ("Failed to fetch Nanoleaf panel layout:") after the Nanoleaf moved to a new IP address. The API client was cached with the old address and reused on every reload until Home Assistant restarted. It now follows the official Nanoleaf integration's entry, including its token, before every request
+- If the Nanoleaf can't be reached when panel entities are set up, Home Assistant now retries in the background (30 s, then up to every 3 minutes) instead of giving up until the next manual reload. This also covers a failed first poll, which previously couldn't be retried
+- Errors from the Nanoleaf now name the cause, e.g. `Request to Nanoleaf at 192.168.20.28 failed: Unavailable (ClientConnectorError: Cannot connect to host …)`. aionanoleaf2 raises its exceptions without a message, so these previously logged as an empty string
+
 ## 1.1.2
 
 - Fixed panel entities turned on in quick succession leaving only one panel lit. Each write replaces the whole display, and concurrent writes merged against the colors from before the burst, so the last one won

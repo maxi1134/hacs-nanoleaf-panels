@@ -205,6 +205,7 @@ mode: restart
 - Panel entity state is updated immediately after a write (no round-trip delay).
 - The integration polls the device every 60 seconds to sync state changed externally.
 - The Nanoleaf only accepts writes for the whole display, so every panel change rewrites all panels. Writes to a device are serialized, and calls arriving within 50 ms of each other are merged into a single write.
+- The device address and token come from the official Nanoleaf integration, so when it picks up a new IP address this integration follows. If the Nanoleaf is unreachable when panel entities are set up, Home Assistant keeps retrying in the background and they appear once it responds.
 
 ## Repository layout
 
