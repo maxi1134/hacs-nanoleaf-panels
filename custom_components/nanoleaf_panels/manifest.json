@@ -8,5 +8,5 @@
   "issue_tracker": "https://github.com/UnsignedLong/hacs-nanoleaf-panels/issues",
   "loggers": ["aionanoleaf2"],
   "requirements": ["aionanoleaf2==1.0.2"],
-  "version": "1.1.4"
+  "version": "1.2.0"
 }

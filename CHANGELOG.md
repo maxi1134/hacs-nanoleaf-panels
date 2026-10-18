@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0
+
+- Panel entities support color temperature, like the official Nanoleaf light, over the device's own range (1200–6500 K on Shapes). Panels only take RGB, so the temperature is converted to RGB and can look slightly different from the whole device set to the same temperature
+- Changing a panel's brightness keeps its color temperature, and panels show the color temperature when the official integration sets one on the whole device. A panel's color temperature survives a restart as long as the device still shows it
+- Fixed panel colors never being read back from the device. The integration looked for the running effect under `selectedEffect`, but the Nanoleaf API calls it `select`. After a restart or reload, panel entities showed as on with no color, and the first panel change blanked every other panel. Colors changed outside Home Assistant (e.g. in the Nanoleaf app) now show up at the next poll
+
 ## 1.1.4
 
 - Error messages no longer include the Nanoleaf's API token. The API carries the token in its URLs, and since 1.1.3 a connection timeout logged something like `Connection timeout to host http://…:16021/api/v1/<token>/`. The token is now replaced with `**REDACTED**`, and the original exception is no longer chained, so tracebacks don't print it either

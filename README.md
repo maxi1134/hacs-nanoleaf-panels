@@ -6,12 +6,12 @@ Control individual Nanoleaf panels from Home Assistant — either via a service 
 
 ### Per-panel light entities
 
-When panel entities are enabled (the default), every physical panel is exposed as an individual HA `light` entity with full color and brightness control:
+When panel entities are enabled (the default), every physical panel is exposed as an individual HA `light` entity with full color, color temperature and brightness control:
 
 - Turn individual panels on or off from the UI, automations, or voice assistants
-- Set color and brightness per panel independently
+- Set color, color temperature and brightness per panel independently
 - Panel entities reflect the device state automatically:
-  - Solid color set via the official Nanoleaf integration → all panel entities update to match
+  - Solid color or color temperature set via the official Nanoleaf integration → all panel entities update to match
   - Turning off all panel entities automatically turns off the parent Nanoleaf
   - Panel entities go off immediately when the parent Nanoleaf is turned off
 - Panel entities are scoped to their parent Nanoleaf device in the device registry (unique entity IDs per device, e.g. `light.nanoleaf_xyz_panel_1`)
@@ -61,8 +61,9 @@ Panel entities are named `Panel 1`, `Panel 2`, … and linked to the parent Nano
 |---|---|
 | On / Off | Turning off all panels also turns off the parent Nanoleaf |
 | Color (HS) | Full hue + saturation control |
-| Brightness | Independent per-panel brightness |
-| State sync | Reflects solid color set via official integration; tracks parent on/off immediately |
+| Color temperature | Same range as the device (1200–6500 K on Shapes). Panels only take RGB, so the temperature is converted to RGB and can look slightly different from the whole device set to it |
+| Brightness | Independent per-panel brightness; changing it keeps the panel's color temperature |
+| State sync | Reflects solid color or color temperature set via official integration; tracks parent on/off immediately; reads per-panel colors back from the device |
 | Bursts | Panels can be switched together (one call targeting several panels, a `parallel:` block, or back-to-back calls) without delays between them |
 
 ## `nanoleaf_panels.set_panels` service

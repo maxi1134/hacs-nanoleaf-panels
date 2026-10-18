@@ -10,6 +10,8 @@ from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_MODE,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
@@ -22,6 +24,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
@@ -40,6 +43,15 @@ from .panel_writer import PanelWriter, get_cached_panel_state, set_cached_panel_
 
 _LOGGER = logging.getLogger(__name__)
 
+# Color temperature range of Nanoleaf Shapes/Canvas, used until the device
+# reports its own.
+DEFAULT_COLOR_TEMP_RANGE = (1200, 6500)
+
+# How far (per RGB channel) a panel's color may be from a color temperature
+# and still count as showing it.  Absorbs rounding when the same color is
+# computed from a brightness in 0-100 (device) and 0-255 (Home Assistant).
+COLOR_TEMP_TOLERANCE = 2
+
 
 def _kelvin_to_rgb(kelvin: int, brightness: float) -> tuple[int, int, int]:
     """Approximate Kelvin color temperature → (r, g, b); brightness in 0‒1."""
@@ -53,6 +65,20 @@ def _kelvin_to_rgb(kelvin: int, brightness: float) -> tuple[int, int, int]:
         g = max(0, min(255, round(288.1221695283 * (temp - 60) ** -0.0755148492)))
         b = 255
     return (round(r * brightness), round(g * brightness), round(b * brightness))
+
+
+def _shows_color_temp(rgb: tuple[int, int, int], kelvin: int) -> bool:
+    """Return whether rgb is the color of kelvin at some brightness."""
+    # _kelvin_to_rgb always has a channel at full scale, so the brightness
+    # is the brightest channel.
+    brightness = max(rgb) / 255
+    if brightness == 0:
+        return False
+    expected = _kelvin_to_rgb(kelvin, brightness)
+    return all(
+        abs(actual - wanted) <= COLOR_TEMP_TOLERANCE
+        for actual, wanted in zip(rgb, expected)
+    )
 
 
 class NanoleafPanelCoordinator(
@@ -84,6 +110,11 @@ class NanoleafPanelCoordinator(
         # the device is in effect mode or just turned on — cache cannot be
         # trusted to reflect which individual panels are lit.
         self.last_poll_had_device_data: bool = False
+        # Panels only take RGB, so this records the color temperature each
+        # panel was last set to, by a panel entity or a uniform ct poll.  It
+        # is only believed while the panel's color still matches it.
+        self.panel_color_temps: dict[int, int] = {}
+        self.color_temp_range: tuple[int, int] = DEFAULT_COLOR_TEMP_RANGE
 
     async def _async_update_data(self) -> dict[int, tuple[int, int, int, int, int]]:
         """Poll current panel colors; merge with in-memory cache as fallback."""
@@ -111,6 +142,11 @@ class NanoleafPanelCoordinator(
             state = info.get("state", {})
             selected_effect = info.get("effects", {}).get("select")
             color_mode = state.get("colorMode", "")
+            ct_range = state.get("ct", {})
+            if isinstance(ct_range.get("min"), int) and isinstance(
+                ct_range.get("max"), int
+            ):
+                self.color_temp_range = (ct_range["min"], ct_range["max"])
 
             if selected_effect == "*Static*":
                 # Device is running our custom per-panel animation.
@@ -131,6 +167,7 @@ class NanoleafPanelCoordinator(
                 else:
                     ct = state.get("ct", {}).get("value", 4000)
                     rgb = _kelvin_to_rgb(ct, bri)
+                    self.panel_color_temps = dict.fromkeys(self.panel_ids, ct)
                 uniform: dict[int, tuple[int, int, int, int, int]] = {
                     pid: (*rgb, 0, DEFAULT_TRANSITION_TIME)
                     for pid in self.panel_ids
@@ -160,12 +197,11 @@ class NanoleafPanelCoordinator(
 
 
 class NanoleafPanelLight(
-    CoordinatorEntity[NanoleafPanelCoordinator], LightEntity
+    CoordinatorEntity[NanoleafPanelCoordinator], LightEntity, RestoreEntity
 ):
     """A light entity representing a single Nanoleaf panel."""
 
-    _attr_color_mode = ColorMode.HS
-    _attr_supported_color_modes = {ColorMode.HS}
+    _attr_supported_color_modes = {ColorMode.COLOR_TEMP, ColorMode.HS}
     _attr_has_entity_name = True
 
     def __init__(
@@ -183,11 +219,50 @@ class NanoleafPanelLight(
         if device_info is not None:
             self._attr_device_info = device_info
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # The device only reports RGB, so a color temperature set before a
+        # restart is carried over from the last state.  _color_temp() still
+        # checks it against the colors the device reports.
+        last_state = await self.async_get_last_state()
+        if (
+            last_state is not None
+            and last_state.attributes.get(ATTR_COLOR_MODE) == ColorMode.COLOR_TEMP
+            and (kelvin := last_state.attributes.get(ATTR_COLOR_TEMP_KELVIN))
+        ):
+            self.coordinator.panel_color_temps.setdefault(self._panel_id, int(kelvin))
+
     @property
     def _panel_state(self) -> tuple[int, int, int, int, int] | None:
         if self.coordinator.data is None:
             return None
         return self.coordinator.data.get(self._panel_id)
+
+    def _color_temp(self) -> int | None:
+        """Return the color temperature the panel shows, if it shows one."""
+        kelvin = self.coordinator.panel_color_temps.get(self._panel_id)
+        s = self._panel_state
+        if kelvin is None or s is None or not _shows_color_temp(s[:3], kelvin):
+            return None
+        return kelvin
+
+    @property
+    def color_mode(self) -> ColorMode:
+        if self._color_temp() is not None:
+            return ColorMode.COLOR_TEMP
+        return ColorMode.HS
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        return self._color_temp()
+
+    @property
+    def min_color_temp_kelvin(self) -> int:
+        return self.coordinator.color_temp_range[0]
+
+    @property
+    def max_color_temp_kelvin(self) -> int:
+        return self.coordinator.color_temp_range[1]
 
     @property
     def is_on(self) -> bool:
@@ -230,6 +305,7 @@ class NanoleafPanelLight(
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         hs: tuple[float, float] | None = kwargs.get(ATTR_HS_COLOR)
+        kelvin: int | None = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
         brightness: int | None = kwargs.get(ATTR_BRIGHTNESS)
 
         # Decompose current state into HSV so each axis is updated independently.
@@ -244,21 +320,45 @@ class NanoleafPanelLight(
         else:
             cur_h, cur_s, cur_v = 0.0, 0.0, 1.0  # default: white
 
-        new_h = (hs[0] / 360) if hs is not None else cur_h
-        new_s = (hs[1] / 100) if hs is not None else cur_s
         new_v = (brightness / 255) if brightness is not None else cur_v
 
-        r_f, g_f, b_f = colorsys.hsv_to_rgb(new_h, new_s, new_v)
-        r, g, b = round(r_f * 255), round(g_f * 255), round(b_f * 255)
+        if hs is None and kelvin is None:
+            # Only the brightness changes: keep the color temperature the
+            # panel shows, if it shows one.
+            kelvin = self._color_temp()
+
+        if kelvin is not None:
+            # Panels only take RGB, so the color temperature is approximated.
+            min_kelvin, max_kelvin = self.coordinator.color_temp_range
+            kelvin = max(min_kelvin, min(max_kelvin, kelvin))
+            r, g, b = _kelvin_to_rgb(kelvin, new_v)
+        else:
+            new_h = (hs[0] / 360) if hs is not None else cur_h
+            new_s = (hs[1] / 100) if hs is not None else cur_s
+            r_f, g_f, b_f = colorsys.hsv_to_rgb(new_h, new_s, new_v)
+            r, g, b = round(r_f * 255), round(g_f * 255), round(b_f * 255)
+
+        # Recorded before the write: the writer updates the entities as soon
+        # as the device has accepted it.
+        color_temps = self.coordinator.panel_color_temps
+        previous_kelvin = color_temps.pop(self._panel_id, None)
+        if kelvin is not None:
+            color_temps[self._panel_id] = kelvin
 
         # When the device is dark, the writer forces all other panels to
         # black so that only this panel lights up (not the full cached scene).
         # The write is batched with any concurrent panel calls and pushed to
         # the coordinator by the writer.
-        await self.coordinator.writer.async_write(
-            {self._panel_id: [(r, g, b, 0, DEFAULT_TRANSITION_TIME)]},
-            blank_others_when_off=True,
-        )
+        try:
+            await self.coordinator.writer.async_write(
+                {self._panel_id: [(r, g, b, 0, DEFAULT_TRANSITION_TIME)]},
+                blank_others_when_off=True,
+            )
+        except Exception:
+            color_temps.pop(self._panel_id, None)
+            if previous_kelvin is not None:
+                color_temps[self._panel_id] = previous_kelvin
+            raise
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         # If the device is already dark, all panel entities already report
