@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.4
+
+- Error messages no longer include the Nanoleaf's API token. The API carries the token in its URLs, and since 1.1.3 a connection timeout logged something like `Connection timeout to host http://…:16021/api/v1/<token>/`. The token is now replaced with `**REDACTED**`, and the original exception is no longer chained, so tracebacks don't print it either
+
 ## 1.1.3
 
 - Fixed panel entities failing to load ("Failed to fetch Nanoleaf panel layout:") after the Nanoleaf moved to a new IP address. The API client was cached with the old address and reused on every reload until Home Assistant restarted. It now follows the official Nanoleaf integration's entry, including its token, before every request

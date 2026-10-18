@@ -9,6 +9,7 @@ creating a new ``ClientSession`` on every API call.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, cast
 
 from aiohttp import ClientError, ClientResponse
@@ -21,21 +22,34 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
+# The Nanoleaf API carries the auth token in the URL path (/api/v1/<token>/...),
+# and aiohttp errors quote the request URL.
+_TOKEN_IN_URL = re.compile(r"(/api/v1/)[^/\s'\")]+")
+_REDACTED = "**REDACTED**"
+
+
+def redact_token(text: str, token: str | None = None) -> str:
+    """Remove the Nanoleaf auth token from text that may quote a request URL."""
+    if token:
+        text = text.replace(token, _REDACTED)
+    return _TOKEN_IN_URL.sub(rf"\g<1>{_REDACTED}", text)
+
 
 def describe_error(err: BaseException) -> str:
-    """Describe an exception together with its cause.
+    """Describe an exception together with its cause, without the auth token.
 
     aionanoleaf2 raises its exceptions without a message (e.g. a bare
     ``Unavailable`` once its retries run out), which would otherwise log as an
-    empty string.
+    empty string. The cause is usually an aiohttp error, whose message can
+    include the request URL and so the token.
     """
 
     def _one(exc: BaseException) -> str:
         return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
     if err.__cause__ is None:
-        return _one(err)
-    return f"{_one(err)} ({_one(err.__cause__)})"
+        return redact_token(_one(err))
+    return redact_token(f"{_one(err)} ({_one(err.__cause__)})")
 
 
 def _parse_anim_data(anim_data_str: str) -> dict[int, tuple[int, int, int, int, int]]:
@@ -114,9 +128,12 @@ class NanoleafApiClient:
         try:
             return await nanoleaf._request(method, path, data)
         except (NanoleafException, ClientError) as err:
+            # Not chained: the original exception's message includes the token,
+            # and a traceback would print it.
+            reason = redact_token(describe_error(err), self._token)
             raise HomeAssistantError(
-                f"Request to Nanoleaf at {self._host} failed: {describe_error(err)}"
-            ) from err
+                f"Request to Nanoleaf at {self._host} failed: {reason}"
+            ) from None
 
     async def async_get_device_info(self) -> dict[str, Any]:
         """Fetch full device info from the Nanoleaf."""

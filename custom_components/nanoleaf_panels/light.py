@@ -35,7 +35,7 @@ from .const import (
     CONF_NANOLEAF_ENTITY,
     DEFAULT_TRANSITION_TIME,
 )
-from .nanoleaf_api import NanoleafApiClient, describe_error
+from .nanoleaf_api import NanoleafApiClient, describe_error, redact_token
 from .panel_writer import PanelWriter, get_cached_panel_state, set_cached_panel_state
 
 _LOGGER = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class NanoleafPanelCoordinator(
                 return {**cache, **uniform}
 
         except Exception as err:  # noqa: BLE001
-            reason = str(err) or describe_error(err)
+            reason = redact_token(str(err)) or describe_error(err)
             raise UpdateFailed(f"Failed to fetch Nanoleaf state: {reason}") from err
 
         # Effect mode with a non-static animation — per-panel colors unavailable.
@@ -337,7 +337,7 @@ async def async_setup_entry(
     except Exception as err:  # noqa: BLE001
         # Home Assistant retries the platform in the background, so the panels
         # appear once the device is reachable again.
-        reason = str(err) or describe_error(err)
+        reason = redact_token(str(err)) or describe_error(err)
         raise PlatformNotReady(
             f"Could not fetch the Nanoleaf panel layout: {reason}"
         ) from err
