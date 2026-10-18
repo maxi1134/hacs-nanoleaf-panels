@@ -269,7 +269,7 @@ class PanelWriter:
         # and shows a uniform solid color; the *Static* data would be stale
         # from the last custom write.
         info = await self.api_client.async_get_device_info()
-        if info.get("effects", {}).get("selectedEffect") == "*Static*":
+        if info.get("effects", {}).get("select") == "*Static*":
             colors = await self.api_client.async_get_current_panel_colors()
             if colors:
                 return colors

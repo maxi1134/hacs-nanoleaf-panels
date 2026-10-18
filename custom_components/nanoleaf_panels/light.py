@@ -109,7 +109,7 @@ class NanoleafPanelCoordinator(
             info = await self._api_client.async_get_device_info()
 
             state = info.get("state", {})
-            selected_effect = info.get("effects", {}).get("selectedEffect")
+            selected_effect = info.get("effects", {}).get("select")
             color_mode = state.get("colorMode", "")
 
             if selected_effect == "*Static*":
